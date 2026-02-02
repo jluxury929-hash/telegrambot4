@@ -153,7 +153,6 @@ async function executeSolShotgun(chatId, addr, amt, side = 'BUY') {
         const tx = VersionedTransaction.deserialize(Buffer.from(res.data.transaction, 'base64'));
         tx.sign([solWallet]);
 
-        // Jito Bundle Logic
         const base64Tx = Buffer.from(tx.serialize()).toString('base64');
         const jitoRes = await axios.post(JITO_ENGINE, { jsonrpc: "2.0", id: 1, method: "sendBundle", params: [[base64Tx]] });
         return { success: !!jitoRes.data.result };
@@ -169,20 +168,20 @@ async function executeEvmSwap(chatId, netKey, addr) {
     } catch (e) { return { success: false }; }
 }
 
-// --- 6. CALLBACK LOGIC (FIXED FOR STICKY BUTTONS) ---
+// --- 6. CALLBACK LOGIC ---
 bot.on('callback_query', async (query) => {
     const chatId = query.message.chat.id;
     
-    // Always answer immediately to clear "pending" state
+    // RELEASE BUTTON STICKINESS
     await bot.answerCallbackQuery(query.id).catch(() => {});
 
     if (query.data === "cmd_auto") {
         if (!solWallet) {
-            return bot.sendMessage(chatId, "⚠️ <b>Wallet Error:</b> Connect mnemonic first.", { parse_mode: 'HTML' });
+            return bot.sendMessage(chatId, "⚠️ <b>Connect wallet first!</b>", { parse_mode: 'HTML' });
         }
         SYSTEM.autoPilot = !SYSTEM.autoPilot;
         if (SYSTEM.autoPilot) {
-            bot.sendMessage(chatId, "🚀 **AUTO-PILOT ACTIVE.** Parallel scanning engaged.");
+            bot.sendMessage(chatId, "🚀 **AUTO-PILOT ACTIVE.** Engaged.");
             Object.keys(NETWORKS).forEach(net => startNetworkSniper(chatId, net));
         }
     }
@@ -201,7 +200,6 @@ bot.on('callback_query', async (query) => {
         SYSTEM.atomicOn = !SYSTEM.atomicOn;
     }
 
-    // Refresh menu
     bot.editMessageReplyMarkup(getDashboardMarkup().reply_markup, { 
         chat_id: chatId, 
         message_id: query.message.message_id 
