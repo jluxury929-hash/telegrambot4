@@ -165,32 +165,47 @@ async function executeEvmSwap(chatId, netKey, addr) {
     try {
         const net = NETWORKS[netKey];
         const signer = evmWallet.connect(new JsonRpcProvider(net.rpc));
-        // Placeholder for v9032 EVM Executor contracts
         return { success: true };
     } catch (e) { return { success: false }; }
 }
 
-// --- 6. CALLBACK LOGIC ---
+// --- 6. CALLBACK LOGIC (FIXED FOR STICKY BUTTONS) ---
 bot.on('callback_query', async (query) => {
     const chatId = query.message.chat.id;
+    
+    // Always answer immediately to clear "pending" state
+    await bot.answerCallbackQuery(query.id).catch(() => {});
+
     if (query.data === "cmd_auto") {
-        if (!solWallet) return bot.answerCallbackQuery(query.id, { text: "⚠️ Connect wallet first!", show_alert: true });
+        if (!solWallet) {
+            return bot.sendMessage(chatId, "⚠️ <b>Wallet Error:</b> Connect mnemonic first.", { parse_mode: 'HTML' });
+        }
         SYSTEM.autoPilot = !SYSTEM.autoPilot;
         if (SYSTEM.autoPilot) {
             bot.sendMessage(chatId, "🚀 **AUTO-PILOT ACTIVE.** Parallel scanning engaged.");
             Object.keys(NETWORKS).forEach(net => startNetworkSniper(chatId, net));
         }
     }
+    
     if (query.data === "cycle_amt") {
         const amts = ["0.1", "0.5", "1.0", "5.0"];
         SYSTEM.tradeAmount = amts[(amts.indexOf(SYSTEM.tradeAmount) + 1) % amts.length];
     }
+    
     if (query.data === "cycle_risk") {
         const risks = ["LOW", "MEDIUM", "MAX"];
         SYSTEM.risk = risks[(risks.indexOf(SYSTEM.risk) + 1) % risks.length];
     }
-    bot.editMessageReplyMarkup(getDashboardMarkup().reply_markup, { chat_id: chatId, message_id: query.message.message_id }).catch(() => {});
-    bot.answerCallbackQuery(query.id);
+
+    if (query.data === "tg_atomic") {
+        SYSTEM.atomicOn = !SYSTEM.atomicOn;
+    }
+
+    // Refresh menu
+    bot.editMessageReplyMarkup(getDashboardMarkup().reply_markup, { 
+        chat_id: chatId, 
+        message_id: query.message.message_id 
+    }).catch(() => {});
 });
 
 // --- 7. UPLINK & SCAN HELPERS ---
