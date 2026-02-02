@@ -1,28 +1,29 @@
 {
   "name": "titan-flash-engine",
-  "version": "204.6.1",
-  "description": "APEX PREDATOR v9076: High-Frequency Hybrid Sniper",
+  "version": "204.6.0",
+  "description": "AI-Driven Deterministic Flash Loan Arbitrage Bot (JS Unified)",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
     "setup": "npm install"
   },
   "dependencies": {
-    "@triton-one/yellowstone-grpc": "^5.0.1",
-    "@solana/web3.js": "^1.88.0",
-    "ethers": "^6.7.1",
+    "ethers": "6.7.1",
     "axios": "^1.6.0",
-    "node-telegram-bot-api": "^0.67.0",
+    "sentiment": "^5.0.2",
     "dotenv": "^16.4.1",
     "colors": "^1.4.0",
+    "@flashbots/ethers-provider-bundle": "^1.0.0",
+    "node-telegram-bot-api": "^0.66.0",
+    "ws": "^8.18.0",
+    "@solana/web3.js": "^1.88.0",
     "bip39": "^3.1.0",
     "ed25519-hd-key": "^1.3.0",
-    "bs58": "^5.0.0",
-    "ws": "^8.18.0",
-    "sentiment": "^5.0.2",
-    "cross-fetch": "^4.0.0"
+    "cross-fetch": "^4.0.0",
+    "@triton-one/yellowstone-grpc": "^1.0.0",
+    "bs58": "^5.0.0"
   },
   "engines": {
-    "node": ">=18.20.0"
+    "node": ">=18.0.0"
   }
 }
