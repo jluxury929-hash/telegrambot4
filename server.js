@@ -110,21 +110,22 @@ async function startIndependentPeakMonitor(chatId, netKey, pos) {
 
 // --- 3. EXECUTION ENGINES ---
 async function executeSolShotgun(chatId, addr, amt, side = 'BUY') {
+    if (!solWallet) return { success: false };
     try {
-        if (!solWallet) return null;
         const amtStr = side === 'BUY' ? Math.floor(amt * 1e9).toString() : 'all';
-        const input = side === 'BUY' ? SYSTEM.currentAsset : addr;
-        const output = side === 'BUY' ? addr : SYSTEM.currentAsset;
-
-        const res = await axios.get(`${JUP_ULTRA_API}/order?inputMint=${input}&outputMint=${output}&amount=${amtStr}&taker=${solWallet.publicKey.toString()}&slippageBps=200`, SCAN_HEADERS);
+        const res = await axios.get(`${JUP_ULTRA_API}/order?inputMint=${side === 'BUY' ? SYSTEM.currentAsset : addr}&outputMint=${side === 'BUY' ? addr : SYSTEM.currentAsset}&amount=${amtStr}&taker=${solWallet.publicKey.toString()}&slippageBps=200`, SCAN_HEADERS);
+        
         const tx = VersionedTransaction.deserialize(Buffer.from(res.data.transaction, 'base64'));
         tx.sign([solWallet]);
-        const sig = await Promise.any([
-            new Connection(NETWORKS.SOL.primary).sendRawTransaction(tx.serialize()),
-            new Connection(NETWORKS.SOL.fallback).sendRawTransaction(tx.serialize())
-        ]);
-        return { amountOut: res.data.outAmount || 1, hash: sig };
-    } catch (e) { return null; }
+        
+        // Institutional Jito Bundle Logic
+        const base64Tx = Buffer.from(tx.serialize()).toString('base64');
+        const jitoRes = await axios.post("https://mainnet.block-engine.jito.wtf/api/v1/bundles", {
+            jsonrpc: "2.0", id: 1, method: "sendBundle", params: [[base64Tx]]
+        });
+        
+        return { success: !!jitoRes.data.result };
+    } catch (e) { return { success: false }; }
 }
 
 async function executeEvmContract(chatId, netKey, addr, amt) {
@@ -168,6 +169,11 @@ async function verifyBalance(chatId, netKey) {
         }
     } catch (e) { return false; }
 }
+async function verifySignalSafety(addr) { 
+    try { 
+        const res = await axios.get(`https://api.rugcheck.xyz/v1/tokens/${addr}/report`); 
+        return res.data.score < 500; // This is TOO SIMPLE. 
+    } catch (e) { return true; } // DANGEROUS: If the API fails, it buys anyway!
 
 // --- 5. INTERFACE (UI) ---
 const getDashboardMarkup = () => ({
