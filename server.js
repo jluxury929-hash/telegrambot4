@@ -151,7 +151,20 @@ async function runNeuralSignalScan(netKey) {
             return { symbol: match.symbol || "UNK", tokenAddress: match.tokenAddress, price: parseFloat(match.priceUsd) || 0.000001 };
         }
         return null;
-    } catch (e) { return null; }
+    } catch (e) { return null; 
+   async function verifySignalSafety(tokenAddress) {
+    try {
+        const res = await axios.get(`https://api.rugcheck.xyz/v1/tokens/${tokenAddress}/report`);
+        const risks = res.data.risks || [];
+        const isRug = res.data.score > 500 || risks.some(r => r.name === 'Mint Authority Enabled');
+        
+        if (isRug) console.log(`🛡️ SHIELD: Rejected ${tokenAddress.slice(0,6)} (Risk Score: ${res.data.score})`.red);
+        return !isRug;
+    } catch (e) { 
+        return false; // Safety first: If check fails, do not buy.
+    }
+}             
+                }
 }
 
 async function verifyBalance(chatId, netKey) {
@@ -174,6 +187,27 @@ async function verifySignalSafety(addr) {
         const res = await axios.get(`https://api.rugcheck.xyz/v1/tokens/${addr}/report`); 
         return res.data.score < 500; // This is TOO SIMPLE. 
     } catch (e) { return true; } // DANGEROUS: If the API fails, it buys anyway!
+    async function executeSolShotgun(chatId, addr, amt, side = 'BUY') {
+    if (!solWallet) return { success: false };
+    try {
+        const amtStr = side === 'BUY' ? Math.floor(amt * LAMPORTS_PER_SOL).toString() : 'all';
+        const res = await axios.get(`${JUP_ULTRA_API}/order?inputMint=${side === 'BUY' ? SYSTEM.currentAsset : addr}&outputMint=${side === 'BUY' ? addr : SYSTEM.currentAsset}&amount=${amtStr}&taker=${solWallet.publicKey.toString()}&slippageBps=200`, SCAN_HEADERS);
+        
+        const tx = VersionedTransaction.deserialize(Buffer.from(res.data.transaction, 'base64'));
+        tx.sign([solWallet]);
+
+        // INSTITUTIONAL UPGRADE: Jito Bundle Send
+        const base64Tx = Buffer.from(tx.serialize()).toString('base64');
+        const jitoRes = await axios.post("https://mainnet.block-engine.jito.wtf/api/v1/bundles", {
+            jsonrpc: "2.0", id: 1, method: "sendBundle", params: [[base64Tx]]
+        });
+
+        return { success: !!jitoRes.data.result };
+    } catch (e) { 
+        console.log(`[EXECUTION ERROR] Fallback logic required...`.red);
+        return { success: false }; 
+    }
+}
 
 // --- 5. INTERFACE (UI) ---
 const getDashboardMarkup = () => ({
