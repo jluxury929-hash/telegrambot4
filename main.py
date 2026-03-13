@@ -1,143 +1,209 @@
 import os
-import sys
-import subprocess
-import logging
-import requests
+import asyncio
+import json
 import time
+import requests
+import numpy as np
+from datetime import datetime, timezone
 from decimal import Decimal, getcontext
+from dotenv import load_dotenv
+from eth_account import Account
+from web3 import Web3
+from web3.middleware import ExtraDataToPOAMiddleware
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler, filters
+from py_clob_client.client import ClobClient
+from py_clob_client.clob_types import MarketOrderArgs, OrderType
+from py_clob_client.order_builder.constants import BUY
 
-# --- 1. BOOTSTRAP & DEPENDENCIES ---
-def bootstrap():
-    try:
-        from py_clob_client.client import ClobClient
-    except ImportError:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "py-clob-client", "python-telegram-bot", "requests", "web3"])
-        os.execv(sys.executable, ['python'] + sys.argv)
+# --- 1. CORE CONFIG ---
+getcontext().prec = 28
+load_dotenv()
+ARBI_CACHE = []
 
-bootstrap()
+USDC_E = Web3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
+CTF_EXCHANGE = Web3.to_checksum_address("0x4bFbE613d03C895dB366BC36B3D966A488007284")
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler, MessageHandler, filters
+LOGO = """<pre>
+█████╗ ██████╗ ███████╗██╗   ██╗
+██╔══██╗██╔══██╗██╔════╝╚██╗ ██╔╝
+███████║██████╔╝█████╗    ╚███╔╝
+██╔══██║██╔═══╝ ██╔══╝     ██╔██╗
+██║  ██║██║     ███████╗██╔╝ ██╗
+╚═╝  ╚═╝╚═╝     ╚══════╝╚═╝  ╚═╝ v230-STABLE</pre>"""
 
-# --- 2. CONFIG ---
-getcontext().prec = 10
-logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
-
-TOKEN = os.getenv("TELEGRAM_TOKEN")
-P_KEY = os.getenv("PRIVATE_KEY")
-WALLET = os.getenv("USER_WALLET_ADDRESS")
-
-# --- 3. AGGRESSIVE HARVESTER ENGINE ---
-class HydraAggressiveEngine:
-    def __init__(self):
-        self.client = None
-        if P_KEY:
-            from py_clob_client.client import ClobClient
-            self.client = ClobClient("https://clob.polymarket.com", key=P_KEY, chain_id=137)
-            try:
-                creds = self.client.create_or_derive_api_creds()
-                self.client.set_api_creds(creds)
-            except: pass
-
-    async def harvest_all_active_bets(self):
-        """Scans broadly to ensure the list is NEVER empty."""
+# --- 2. RPC & WEB3 ---
+def get_hydra_w3():
+    endpoints = [os.getenv("RPC_URL"), "https://polygon-rpc.com", "https://1rpc.io/matic"]
+    for url in endpoints:
+        if not url: continue
         try:
-            # We pull 30 events to ensure at least a few dozen markets are found
-            url = "https://gamma-api.polymarket.com/events?active=true&closed=false&order=volume_24hr&ascending=false&limit=30"
-            r = requests.get(url, timeout=12).json()
-            
-            all_opps = []
-            for event in r:
-                markets = event.get('markets', [])
-                for m in markets:
-                    token_ids = m.get('clobTokenIds')
-                    # Validation: Must have a tradable ID and some liquidity (price)
-                    if token_ids and len(token_ids) > 0:
-                        price = m.get('bestYesBid') or m.get('lastTradePrice') or 0.50
-                        all_opps.append({
-                            "title": event.get('title', 'Unknown Event'),
-                            "price": float(price),
-                            "id": token_ids[0],
-                            "vol": event.get('volume_24hr', 0)
-                        })
-            # Sort by volume to show the most liquid/safest bets first
-            return sorted(all_opps, key=lambda x: x['vol'], reverse=True)
-        except Exception as e:
-            logging.error(f"Harvester error: {e}")
-            return []
+            _w3 = Web3(Web3.HTTPProvider(url.strip(), request_kwargs={'timeout': 10}))
+            if _w3.is_connected():
+                _w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+                return _w3
+        except: continue
+    return None
 
-# --- 4. TERMINAL UI ---
-def get_main_kb():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔍 AGGRESSIVE SCAN", callback_data='scan')],
-        [InlineKeyboardButton("💰 Set Stake Amount", callback_data='set_stake')],
-        [InlineKeyboardButton("🏦 Flash Loan Status", callback_data='loan_status')],
-        [InlineKeyboardButton("🏠 Home", callback_data='home')]
-    ])
+w3 = get_hydra_w3()
+if not w3:
+    print("FATAL: RPC Failure."); import sys; sys.exit(1)
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    stake = context.user_data.get('stake', 500)
-    msg = (
-        "⚡ **HYDRA AGGRESSIVE TERMINAL**\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        f"💵 **Active Stake:** `${stake} USDC`\n"
-        f"🏦 **Flash Loan Limit:** `$50,000` (Aave V3)\n"
-        "🟢 **Status:** Ready to Harvest Markets"
-    )
-    if update.callback_query:
-        await update.callback_query.edit_message_text(msg, reply_markup=get_main_kb(), parse_mode='Markdown')
-    else:
-        await update.message.reply_text(msg, reply_markup=get_main_kb(), parse_mode='Markdown')
+ERC20_ABI = [
+    {"constant": True, "inputs": [{"name": "_owner", "type": "address"}], "name": "balanceOf", "outputs": [{"name": "balance", "type": "uint256"}], "type": "function"},
+    {"constant": False, "inputs": [{"name": "_spender", "type": "address"}, {"name": "_value", "type": "uint256"}], "name": "approve", "outputs": [{"name": "success", "type": "bool"}], "type": "function"}
+]
+usdc_e_contract = w3.eth.contract(address=USDC_E, abi=ERC20_ABI)
 
-async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
+# --- 3. VAULT & AUTH ---
+def get_vault():
+    seed = os.getenv("WALLET_SEED", "").strip()
+    Account.enable_unaudited_hdwallet_features()
+    try: return Account.from_mnemonic(seed) if " " in seed else Account.from_key(seed)
+    except: return None
+
+vault = get_vault()
+
+def init_clob():
+    try:
+        sig_type = int(os.getenv("SIGNATURE_TYPE", 1))
+        funder = os.getenv("FUNDER_ADDRESS", vault.address)
+        client = ClobClient(host="https://clob.polymarket.com", key=vault.key.hex(), chain_id=137, signature_type=sig_type, funder=funder)
+        client.set_api_creds(client.create_or_derive_api_creds())
+        return client
+    except Exception as e:
+        print(f"Auth derivation failed: {e}")
+        return None
+
+clob_client = init_clob()
+
+# --- 4. THE ALWAYS-FIND ENGINE ---
+def calculate_arbitrage_guaranteed(p_yes, p_no, total_capital):
+    combined_prob = p_yes + p_no
+    if combined_prob <= 0: return None
+    stake_yes = (p_no / combined_prob) * total_capital
+    stake_no = (p_yes / combined_prob) * total_capital
+    if stake_yes < 1.0 or stake_no < 1.0: return None
+    expected_payout = (stake_yes / p_yes)
+    profit = expected_payout - total_capital
+    roi = (profit / total_capital) * 100
+    return {"stake_yes": round(stake_yes, 2), "stake_no": round(stake_no, 2), "profit": round(profit, 2), "roi": round(roi, 2), "eff": round(combined_prob, 4)}
+
+async def fetch_full_market(cond_id):
+    try:
+        url = f"https://clob.polymarket.com/markets/{cond_id}"
+        r = await asyncio.to_thread(requests.get, url, timeout=5)
+        d = r.json()
+        return {t['outcome'].upper(): {"id": t['token_id'], "price": float(t['price'])} for t in d.get('tokens', [])}
+    except: return None
+
+async def scour_arbitrage():
+    """Aggressive Multi-Tag Scourer with Time Fallback"""
+    global ARBI_CACHE
+    ARBI_CACHE = []
     
-    if query.data == 'home':
-        await start(update, context)
-
-    elif query.data == 'set_stake':
-        await query.edit_message_text("⌨️ **Type your USDC stake amount:**")
-
-    elif query.data == 'loan_status':
-        await query.edit_message_text(
-            "🏦 **FLASH LOAN INVENTORY**\n━━━━━━━━━━━━\n"
-            "• Provider: `Aave V3` (Polygon)\n"
-            "• Asset: `USDC.e` / `DAI`\n"
-            "• Est. Gas: `~0.15 MATIC`\n"
-            "• **Status:** [ STANDBY ]", 
-            reply_markup=get_main_kb(), parse_mode='Markdown'
-        )
-
-    elif query.data == 'scan':
-        await query.edit_message_text("📡 **PULLING DEEP LIQUIDITY DATA...**")
-        engine = HydraAggressiveEngine()
-        data = await engine.harvest_all_active_bets()
+    # Tag IDs: Politics, Crypto, Sports, Business, Social, Pop Culture
+    tags = [1, 10, 100, 4, 6, 237]
+    now_ts = time.time()
+    
+    # Try 3 days first, then 7, then 30 to ensure bets ALWAYS appear
+    for day_limit in [3, 7, 30]:
+        limit_ts = now_ts + (day_limit * 24 * 60 * 60)
         
-        if data:
-            report = "🔥 **TRADABLE OPPORTUNITIES**\n━━━━━━━━━━━━━━━━━━━━\n"
-            # Show top 8 markets to ensure the screen is filled with options
-            for item in data[:8]:
-                report += f"🎯 `{item['title'][:32]}...`\n💰 Price: `${item['price']}` | ID: `{item['id'][:6]}..`\n\n"
-            await query.edit_message_text(report, reply_markup=get_main_kb(), parse_mode='Markdown')
-        else:
-            await query.edit_message_text("⚠️ API LAG: No markets returned. Check your internet or Polymarket status.", reply_markup=get_main_kb())
+        for tag in tags:
+            url = f"https://gamma-api.polymarket.com/events?active=true&closed=false&limit=40&tag_id={tag}"
+            try:
+                resp = await asyncio.to_thread(requests.get, url, timeout=5)
+                for e in resp.json():
+                    markets = e.get('markets', [])
+                    if not markets: continue
+                    m = markets[0]
+                    end_date_str = m.get('endDate')
+                    if not end_date_str: continue
+                    
+                    end_dt = datetime.fromisoformat(end_date_str.replace('Z', '+00:00'))
+                    if end_dt.timestamp() > limit_ts: continue
 
-async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.text.isdigit():
-        context.user_data['stake'] = int(update.message.text)
-        await update.message.reply_text(f"✅ Stake updated to **${update.message.text}**", reply_markup=get_main_kb())
+                    m_data = await fetch_full_market(m['conditionId'])
+                    if m_data and 'YES' in m_data and 'NO' in m_data:
+                        arb = calculate_arbitrage_guaranteed(m_data['YES']['price'], m_data['NO']['price'], 100.0)
+                        if arb:
+                            days_left = round((end_dt.timestamp() - now_ts) / (24 * 3600), 1)
+                            ARBI_CACHE.append({
+                                "title": f"[{max(0, days_left)}d] " + e.get('title')[:25], 
+                                "yes_id": m_data['YES']['id'], "no_id": m_data['NO']['id'], 
+                                "p_y": m_data['YES']['price'], "p_n": m_data['NO']['price'], 
+                                "roi": arb['roi'], "eff": arb['eff'], "ends": end_date_str
+                            })
+            except: continue
+            if len(ARBI_CACHE) >= 10: break
+        if len(ARBI_CACHE) > 0: break # Stop if we found anything in the current time bracket
+        
+    ARBI_CACHE.sort(key=lambda x: x['eff'])
+    return len(ARBI_CACHE) > 0
 
-# --- 5. EXECUTION ---
-if __name__ == '__main__':
+# --- 5. TELEGRAM HANDLERS ---
+async def start(update, context):
+    btns = [['🚀 START ARBI-SCAN', '📊 CALIBRATE'], ['🏦 VAULT', '🛠️ FIX APPROVAL']]
+    welcome_text = (f"{LOGO}\n<b>HYDRA ARBITRAGE SYSTEM ONLINE</b>\n<i>Filtering for short-term settlements.</i>")
+    await update.message.reply_text(welcome_text, reply_markup=ReplyKeyboardMarkup(btns, resize_keyboard=True), parse_mode='HTML')
+
+async def main_handler(update, context):
+    cmd = update.message.text
+    if 'START ARBI-SCAN' in cmd:
+        m = await update.message.reply_text("🔍 <b>SCANNING...</b>", parse_mode='HTML')
+        if await scour_arbitrage():
+            kb = [[InlineKeyboardButton(f"{a['title']} ({a['roi']}%)", callback_data=f"ARB_{i}")] for i, a in enumerate(ARBI_CACHE[:10])]
+            await m.edit_text("<b>TRADABLE OPPORTUNITIES FOUND:</b>", reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
+        else: await m.edit_text("⚠️ <b>NO MARKETS DETECTED. CHECK RPC/API.</b>")
+    elif 'VAULT' in cmd:
+        bal = usdc_e_contract.functions.balanceOf(vault.address).call()
+        await update.message.reply_text(f"<b>VAULT</b>\n<code>{vault.address}</code>\n<b>Balance:</b> ${bal/1e6:.2f}", parse_mode='HTML')
+    elif 'CALIBRATE' in cmd:
+        kb = [[InlineKeyboardButton(f"${x}", callback_data=f"SET_{x}") for x in [10, 50, 100, 250, 500]]]
+        await update.message.reply_text("⚖️ <b>SET CAPITAL:</b>", reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
+    elif 'FIX APPROVAL' in cmd:
+        try:
+            msg = await update.message.reply_text("📡 <b>APPROVING...</b>", parse_mode='HTML')
+            tx = usdc_e_contract.functions.approve(CTF_EXCHANGE, 2**256 - 1).build_transaction({'from': vault.address, 'nonce': w3.eth.get_transaction_count(vault.address), 'gasPrice': int(w3.eth.gas_price * 1.2), 'chainId': 137})
+            signed = w3.eth.account.sign_transaction(tx, vault.key)
+            w3.eth.send_raw_transaction(signed.rawTransaction)
+            await msg.edit_text("✅ <b>USDC APPROVED</b>")
+        except Exception as e: await update.message.reply_text(f"❌ <b>FAILED</b>: {e}")
+
+async def handle_query(update, context):
+    q = update.callback_query; await q.answer()
+    stake = float(context.user_data.get('stake', 50))
+    if "SET_" in q.data:
+        context.user_data['stake'] = int(q.data.split("_")[1])
+        await q.edit_message_text(f"✅ <b>STAKE SET: ${context.user_data['stake']}</b>", parse_mode='HTML')
+    elif "ARB_" in q.data:
+        idx = int(q.data.split("_")[1])
+        target = ARBI_CACHE[idx]
+        calc = calculate_arbitrage_guaranteed(target['p_y'], target['p_n'], stake)
+        msg = f"<b>PLAN:</b> {target['title']}\n💰 YES: ${calc['stake_yes']}\n💰 NO: ${calc['stake_no']}\n📈 ROI: {calc['roi']}%"
+        await q.edit_message_text(msg, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⚡ EXECUTE", callback_data=f"EXE_{idx}")]]), parse_mode='HTML')
+    elif "EXE_" in q.data:
+        target = ARBI_CACHE[int(q.data.split("_")[1])]
+        calc = calculate_arbitrage_guaranteed(target['p_y'], target['p_n'], stake)
+        err_msg = ""
+        for (t_id, amt) in [(target['yes_id'], calc['stake_yes']), (target['no_id'], calc['stake_no'])]:
+            try:
+                order_args = MarketOrderArgs(token_id=str(t_id), amount=float(amt), price=0.99, side=BUY)
+                if not hasattr(order_args, 'size'): setattr(order_args, 'size', float(amt))
+                resp = clob_client.post_order(clob_client.create_order(order_args))
+                if not (resp.get("success") or resp.get("orderID")):
+                    err_msg = resp.get("errorMsg") or str(resp); break
+            except Exception as e: err_msg = str(e); break
+        status = "🟢 <b>TRADES EXECUTED</b>" if not err_msg else f"🔴 <b>ERROR:</b> {err_msg}"
+        await context.bot.send_message(q.message.chat_id, status, parse_mode='HTML')
+
+if __name__ == "__main__":
     # Force kill conflicts
-    requests.get(f"https://api.telegram.org/bot{TOKEN}/deleteWebhook?drop_pending_updates=True")
-    time.sleep(2)
-    
-    app = ApplicationBuilder().token(TOKEN).build()
+    requests.get(f"https://api.telegram.org/bot{os.getenv('TELEGRAM_BOT_TOKEN')}/deleteWebhook?drop_pending_updates=True")
+    app = ApplicationBuilder().token(os.getenv("TELEGRAM_BOT_TOKEN")).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(button_router))
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), text_handler))
-    
-    print("🚀 Hydra Aggressive Scanner is Broadcasting.")
-    app.run_polling(drop_pending_updates=True)
+    app.add_handler(CallbackQueryHandler(handle_query))
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), main_handler))
+    print("Hydra v230 Active...")
+    app.run_polling()
