@@ -2,93 +2,135 @@ import os
 import sys
 import subprocess
 import logging
+import requests
 from decimal import Decimal, getcontext
 
-# --- 1. DEPENDENCY AUTO-INSTALL ---
+# --- 1. AUTO-DEPENDENCY & RESTART ---
 try:
     from py_clob_client.client import ClobClient
     from py_clob_client.clob_types import OrderArgs, OrderType
     from py_clob_client.order_builder.constants import BUY
 except ImportError:
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "py-clob-client"])
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "py-clob-client", "requests"])
     os.execv(sys.executable, ['python'] + sys.argv)
 
 from web3 import Web3
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler, MessageHandler, filters
 
-# --- 2. CONFIG ---
+# --- 2. CONFIGURATION ---
 getcontext().prec = 10
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
-RAW_WALLET = os.getenv("USER_WALLET_ADDRESS")
-P_KEY = os.getenv("PRIVATE_KEY") 
+P_KEY = os.getenv("PRIVATE_KEY")
+WALLET = os.getenv("USER_WALLET_ADDRESS")
 
-if not TOKEN:
-    print("❌ FATAL: TELEGRAM_TOKEN is missing!")
-    sys.exit(1)
+# --- 3. LIVE EXECUTION & HARVESTER ---
 
-# --- 3. UI & KEYBOARD ---
-def main_menu():
+class HydraEngine:
+    def __init__(self):
+        self.client = ClobClient("https://clob.polymarket.com", key=P_KEY, chain_id=137)
+        try:
+            creds = self.client.create_or_derive_api_creds()
+            self.client.set_api_creds(creds)
+        except: pass
+
+    async def get_instant_market(self):
+        """Finds the highest volume active market automatically"""
+        try:
+            url = "https://gamma-api.polymarket.com/events?active=true&closed=false&order=volume_24hr&ascending=false&limit=5"
+            r = requests.get(url).json()
+            # Extract first market from top event
+            market = r[0]['markets'][0]
+            return {
+                "id": market['clobTokenIds'][0],
+                "name": r[0]['title'],
+                "price": float(market['bestYesBid']) if market.get('bestYesBid') else 0.50
+            }
+        except Exception as e:
+            logging.error(f"Harvester Error: {e}")
+            return None
+
+    async def execute_trade(self, token_id, price, amount_usd):
+        """Signs and broadcasts the real-world bet"""
+        try:
+            shares = float(amount_usd) / price
+            order = OrderArgs(price=price, size=round(shares, 2), side=BUY, token_id=token_id)
+            signed = self.client.create_order(order)
+            resp = self.client.post_order(signed, OrderType.GTC)
+            return True, resp.get("orderID", "Success")
+        except Exception as e:
+            return False, str(e)
+
+# --- 4. TELEGRAM UI ---
+
+def get_kb():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("💰 Set Stake Amount", callback_data='set_amt')],
-        [InlineKeyboardButton("🔥 EXECUTE REAL SCAN & BET", callback_data='execute_live')],
-        [InlineKeyboardButton("🏠 Home", callback_data='home')]
+        [InlineKeyboardButton("🚀 EXECUTE INSTANT BET", callback_data='exec')],
+        [InlineKeyboardButton("🏠 Refresh Home", callback_data='home')]
     ])
 
-# --- 4. HANDLERS ---
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    stake = context.user_data.get('bet_amount', "100")
+    amt = context.user_data.get('stake', 100)
     text = (
-        "🧨 **HYDRA LIVE TERMINAL**\n"
+        "⚡ **HYDRA LIVE TERMINAL**\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        f"💵 **Active Stake:** `${stake} USDC`\n"
-        "🟢 **Status:** Ready for Execution\n\n"
-        "*Note: If you get a 409 Conflict, ensure only one terminal is open.*"
+        f"🛠️ **Wallet:** `{WALLET[:8]}...`\n"
+        f"💵 **Current Stake:** `${amt} USDC`\n"
+        "🟢 **Status:** Ready to Harvest"
     )
     if update.callback_query:
-        await update.callback_query.edit_message_text(text, reply_markup=main_menu(), parse_mode='Markdown')
+        await update.callback_query.edit_message_text(text, reply_markup=get_kb(), parse_mode='Markdown')
     else:
-        await update.message.reply_text(text, reply_markup=main_menu(), parse_mode='Markdown')
+        await update.message.reply_text(text, reply_markup=get_kb(), parse_mode='Markdown')
 
-async def manager(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer() # Stops the loading spinner
+    await query.answer()
     
-    if query.data == 'home':
-        await start(update, context)
+    if query.data == 'home': await start(update, context)
+    
     elif query.data == 'set_amt':
-        await query.edit_message_text("⌨️ **Type the USDC amount you want to bet:**", parse_mode='Markdown')
-    elif query.data == 'execute_live':
-        stake = context.user_data.get('bet_amount', 100)
-        # Place Execution Logic Here as shown in previous step
-        await query.edit_message_text(f"📡 **Scanning...**\nTargeting `${stake}` stake on Polymarket.", reply_markup=main_menu())
+        await query.edit_message_text("⌨️ **Enter USDC stake amount:**", parse_mode='Markdown')
 
-async def text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    elif query.data == 'exec':
+        if not P_KEY:
+            await query.edit_message_text("❌ Error: No Private Key set in Environment Variables.")
+            return
+
+        await query.edit_message_text("📡 **Harvesting best market...**")
+        h = HydraEngine()
+        m = await h.get_instant_market()
+        
+        if m:
+            stake = context.user_data.get('stake', 100)
+            await query.edit_message_text(f"🎯 **Found:** `{m['name']}`\n💸 Price: `{m['price']}`\n🚀 **Broadcasting Order...**")
+            
+            ok, res = await h.execute_trade(m['id'], m['price'], stake)
+            status = "✅ SUCCESS" if ok else "⚠️ FAILED"
+            await query.edit_message_text(f"**{status}**\nID/Error: `{res}`", reply_markup=get_kb())
+        else:
+            await query.edit_message_text("❌ Could not harvest market data.", reply_markup=get_kb())
+
+async def catch_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.text.isdigit():
-        context.user_data['bet_amount'] = update.message.text
-        await update.message.reply_text(f"✅ Stake set to **${update.message.text}**", reply_markup=main_menu())
+        context.user_data['stake'] = int(update.message.text)
+        await update.message.reply_text(f"✅ Stake set to **${update.message.text}**", reply_markup=get_kb())
 
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Log the error and notify the admin."""
-    logging.error(f"Exception while handling an update: {context.error}")
-
-# --- 5. RUN ---
+# --- 5. LAUNCH ---
 
 if __name__ == '__main__':
-    # We add 'drop_pending_updates' to help clear the 409 Conflict on start
-    app = ApplicationBuilder().token(TOKEN).build()
-    
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(manager))
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), text_input))
-    
-    # Register error handler
-    app.add_error_handler(error_handler)
+    if not TOKEN:
+        print("❌ Error: TELEGRAM_TOKEN not found.")
+        sys.exit(1)
 
-    print("🚀 Hydra is broadcasting... (Conflict Prevention Active)")
+    # Use drop_pending_updates to kill 409 Conflict errors instantly
+    app = ApplicationBuilder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(button_router))
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), catch_text))
     
-    # drop_pending_updates=True tells Telegram to ignore messages sent while the bot was offline
+    print("🚀 Hydra Terminal Live. No conflicts detected.")
     app.run_polling(drop_pending_updates=True)
