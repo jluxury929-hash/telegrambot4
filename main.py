@@ -10,138 +10,136 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, Callb
 getcontext().prec = 10
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 
+# SECURITY: Fetching from environment
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 RPC_URL = os.getenv("POLYGON_RPC_URL", "https://polygon-rpc.com")
-WALLET_ADDRESS = os.getenv("USER_WALLET_ADDRESS", "0x0000...0000") # Replace with real address
+RAW_WALLET = os.getenv("USER_WALLET_ADDRESS")
 
+# VALIDATION: Ensuring the wallet is real and formatted correctly
+if not RAW_WALLET or not Web3.is_address(RAW_WALLET):
+    print("❌ FATAL: USER_WALLET_ADDRESS is invalid or not set in environment!")
+    sys.exit(1)
+
+WALLET_ADDRESS = Web3.to_checksum_address(RAW_WALLET)
+
+# AAVE V3 Polygon Smart Contract Addresses
 AAVE_POOL_V3 = "0x7937d4799803Fb3ad9212d7164cc9B1aB96048a1"
 AAVE_ABI = [{"inputs":[{"internalType":"address","name":"user","type":"address"}],"name":"getUserAccountData","outputs":[{"internalType":"uint256","name":"totalCollateralBase","type":"uint256"},{"internalType":"uint256","name":"totalDebtBase","type":"uint256"},{"internalType":"uint256","name":"availableBorrowsBase","type":"uint256"},{"internalType":"uint256","name":"currentLiquidationThreshold","type":"uint256"},{"internalType":"uint256","name":"ltv","type":"uint256"},{"internalType":"uint256","name":"healthFactor","type":"uint256"}],"stateMutability":"view","type":"function"}]
 
 w3 = Web3(Web3.HTTPProvider(RPC_URL))
 
-# --- LOGIC ---
+# --- CORE LOGIC ---
 
 class ArbEngine:
     @staticmethod
     def get_implied_prob(odds):
-        odds = Decimal(odds)
+        odds = Decimal(str(odds))
         return Decimal(100) / (odds + 100) if odds > 0 else abs(odds) / (abs(odds) + 100)
 
     def analyze(self, odds_a, odds_b, target_payout):
         prob_a, prob_b = self.get_implied_prob(odds_a), self.get_implied_prob(odds_b)
         total_prob = prob_a + prob_b
-        if total_prob >= 1.0: return None # Arbitrage filter
+        
+        if total_prob >= 1.0: return None # Guarantee P/L > 1
 
-        stake_a, stake_b = Decimal(target_payout) * prob_a, Decimal(target_payout) * prob_b
+        stake_a = Decimal(target_payout) * prob_a
+        stake_b = Decimal(target_payout) * prob_b
         total_cost = stake_a + stake_b
         profit = Decimal(target_payout) - total_cost
+        
         return {
             "stake_a": round(stake_a, 2), "stake_b": round(stake_b, 2),
-            "profit": round(profit, 2), "roi": round((profit / total_cost) * 100, 2)
+            "total_cost": round(total_cost, 2), "profit": round(profit, 2),
+            "roi": round((profit / total_cost) * 100, 2)
         }
 
 class AaveManager:
-    def get_data(self):
+    def __init__(self):
+        self.contract = w3.eth.contract(address=AAVE_POOL_V3, abi=AAVE_ABI)
+
+    def get_user_status(self):
         try:
-            contract = w3.eth.contract(address=AAVE_POOL_V3, abi=AAVE_ABI)
-            d = contract.functions.getUserAccountData(WALLET_ADDRESS).call()
-            return {"borrow_power": Decimal(d[2]) / Decimal(10**8), "health": Decimal(d[5]) / Decimal(1e18)}
-        except:
-            return {"borrow_power": Decimal(5000), "health": Decimal(2.5)} # Mock for demo if RPC fails
+            d = self.contract.functions.getUserAccountData(WALLET_ADDRESS).call()
+            # Aave Base currency is 8 decimals
+            return {
+                "borrow_power": Decimal(d[2]) / Decimal(10**8), 
+                "health": Decimal(d[5]) / Decimal(1e18)
+            }
+        except Exception as e:
+            logging.error(f"RPC Error: {e}")
+            return {"borrow_power": Decimal(0), "health": Decimal(0)}
 
-# --- KEYBOARDS ---
+# --- UI CONTROLLER ---
 
-def main_menu_kb():
+def main_kb():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔍 Scan Markets", callback_data='scan'),
-         InlineKeyboardButton("🏦 Aave Status", callback_data='credit')],
-        [InlineKeyboardButton("⚙️ Risk Settings", callback_data='settings')],
-        [InlineKeyboardButton("🔄 Refresh Dashboard", callback_data='menu')]
-    ])
-
-def back_to_menu_kb():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back to Main Menu", callback_data='menu')]])
-
-# --- HANDLERS ---
-
-async def post_init(application):
-    await application.bot.set_my_commands([
-        BotCommand("start", "Boot Terminal"),
-        BotCommand("scan", "Run Arb Scanner")
+        [InlineKeyboardButton("🔍 Scan Live Arb", callback_data='scan')],
+        [InlineKeyboardButton("🏦 Aave Credit Line", callback_data='credit')],
+        [InlineKeyboardButton("🔄 Refresh Dashboard", callback_data='home')]
     ])
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
-        "⚡ **HYDRA TERMINAL ONLINE**\n"
+        "⚡ **HYDRA ARBITRAGE TERMINAL**\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        f"**Wallet:** `{WALLET_ADDRESS[:6]}...{WALLET_ADDRESS[-4:]}`\n"
-        "**Status:** `Scanning for P/L > 1`\n\n"
-        "Select an operation:"
+        f"🛠️ **ACTIVE WALLET:** `{WALLET_ADDRESS}`\n"
+        "📡 **NETWORK:** `Polygon POS`\n"
+        "⚖️ **LOGIC:** `CREDIT-LINE LEVERAGE`"
     )
-    # Handle both /start command and button callback
     if update.message:
-        await update.message.reply_text(text, reply_markup=main_menu_kb(), parse_mode='Markdown')
+        await update.message.reply_text(text, reply_markup=main_kb(), parse_mode='Markdown')
     else:
-        await update.callback_query.edit_message_text(text, reply_markup=main_menu_kb(), parse_mode='Markdown')
+        await update.callback_query.edit_message_text(text, reply_markup=main_kb(), parse_mode='Markdown')
 
-async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def interaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    data = query.data
     await query.answer()
-
-    engine = ArbEngine()
+    
     bank = AaveManager()
+    engine = ArbEngine()
 
-    if data == 'menu':
+    if query.data == 'home':
         await start(update, context)
 
-    elif data == 'scan':
-        # Example calculation using $1000 target payout or Aave capacity
-        res = engine.analyze(240, -220, 1000)
+    elif query.data == 'credit':
+        data = bank.get_user_status()
+        status = "🟢 HEALTHY" if data['health'] > 1.5 else "⚠️ RISK"
+        msg = (
+            "🏦 **YOUR AAVE V3 POSITION**\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"💰 **Limit:** `${data['borrow_power']:.2f} USDC`\n"
+            f"🛡️ **Health:** `{data['health']:.2f}`\n"
+            f"🚦 **Status:** {status}"
+        )
+        await query.edit_message_text(msg, reply_markup=main_kb(), parse_mode='Markdown')
+
+    elif query.data == 'scan':
+        # REAL-TIME CHECK: Use your actual Aave borrow power for the calculation
+        data = bank.get_user_status()
+        max_stake = data['borrow_power'] if data['borrow_power'] > 10 else 1000
+        
+        # Example Odds (Replace with real Market API feed)
+        res = engine.analyze(240, -220, max_stake)
+        
         if res:
             msg = (
-                "🎯 **ARB OPPORTUNITY FOUND**\n"
+                "🎯 **ARBITRAGE OPPORTUNITY**\n"
                 "━━━━━━━━━━━━━━━━━━━━\n"
-                f"🔹 **Bet Side A (+240):** `${res['stake_a']}`\n"
-                f"🔹 **Bet Side B (-220):** `${res['stake_b']}`\n"
-                f"💰 **Guaranteed Profit:** `${res['profit']}`\n"
-                f"📈 **ROI:** `{res['roi']}%`"
+                f"✅ **Bet A (+240):** `${res['stake_a']}`\n"
+                f"✅ **Bet B (-220):** `${res['stake_b']}`\n"
+                f"💰 **Total Profit:** `${res['profit']}`\n"
+                f"📈 **Leveraged ROI:** `{res['roi']}%`"
             )
         else:
-            msg = "🔎 **Scanning...**\nNo gaps found where P/L > 1."
-        await query.edit_message_text(msg, reply_markup=back_to_menu_kb(), parse_mode='Markdown')
+            msg = "🔎 Scanning... Markets are efficient (P/L ≤ 1)."
+        
+        await query.edit_message_text(msg, reply_markup=main_kb(), parse_mode='Markdown')
 
-    elif data == 'credit':
-        stats = bank.get_data()
-        msg = (
-            "🏦 **AAVE V3 CREDIT LINE**\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            f"• **Available:** `${stats['borrow_power']:.2f} USDC`\n"
-            f"• **Health Factor:** `{stats['health']:.2f}`\n"
-            "• **Mode:** `Credit-Line Persistence`"
-        )
-        await query.edit_message_text(msg, reply_markup=back_to_menu_kb(), parse_mode='Markdown')
-
-    elif data == 'settings':
-        msg = (
-            "⚙️ **TERMINAL SETTINGS**\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "• **Min ROI Filter:** `1.5%`\n"
-            "• **Auto-Leverage:** `OFF`\n"
-            "• **Safety HF:** `1.20`"
-        )
-        await query.edit_message_text(msg, reply_markup=back_to_menu_kb(), parse_mode='Markdown')
-
-# --- RUN ---
+# --- MAIN ---
 
 if __name__ == '__main__':
-    if not TELEGRAM_TOKEN:
-        print("❌ Set TELEGRAM_TOKEN env var.")
-        sys.exit(1)
-
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(post_init).build()
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(handle_buttons))
-    
-    print("🚀 Hydra Terminal Live.")
+    app.add_handler(CallbackQueryHandler(interaction))
+    print(f"🚀 Hydra Terminal connected to {WALLET_ADDRESS}")
     app.run_polling()
